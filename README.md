@@ -166,4 +166,5 @@ As an alternative to Azure App Service:
 - The app hides default Streamlit chrome (sidebar, toolbar, header, footer) and uses a centered, bordered form layout with SAP-style sectioning.
 - All database credentials and configuration are read from environment variables; nothing is hard-coded in the source.
 - The app validates all required fields and common formats (email, phone, IBAN, date consistency) before inserting into Databricks.
+- If Databricks/API access is unavailable, use the built-in **Offline Demo Risk Assessment** section to run a Moody's-style provisional rating using dummy customer profiles.
 

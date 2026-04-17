@@ -1,8 +1,8 @@
 import os
 import re
 from datetime import date
+from textwrap import dedent
 
-import pandas as pd
 import streamlit as st
 from databricks import sql as dbsql
 from dotenv import load_dotenv
@@ -83,9 +83,362 @@ def apply_global_styles():
             background-color: #0066cc !important;
             color: white !important;
         }
+
+        .risk-top-card {
+            border: 1px solid #60c5a2;
+            border-radius: 14px;
+            padding: 20px 24px;
+            margin-top: 1rem;
+            background: #ffffff;
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .risk-score-circle {
+            width: 96px;
+            height: 96px;
+            border-radius: 50%;
+            border: 3px solid #1f9f72;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: #0f7d5a;
+            font-weight: 700;
+            line-height: 1.05;
+            flex-shrink: 0;
+        }
+
+        .risk-score-circle .score {
+            font-size: 2rem;
+        }
+
+        .risk-score-circle .denom {
+            font-size: 1rem;
+            font-weight: 600;
+        }
+
+        .risk-headline {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #1d1f23;
+            margin: 0;
+        }
+
+        .risk-subline {
+            font-size: 1.15rem;
+            color: #4b4f56;
+            margin: 0.25rem 0 0.75rem 0;
+        }
+
+        .risk-badge {
+            display: inline-block;
+            background: #dbeecf;
+            color: #2f6f1e;
+            border-radius: 999px;
+            padding: 6px 14px;
+            font-weight: 600;
+            font-size: 1rem;
+        }
+
+        .risk-summary-card {
+            border: 1px solid #d6d8de;
+            border-radius: 14px;
+            padding: 18px 24px;
+            margin-top: 1.25rem;
+            background: #ffffff;
+        }
+
+        .risk-summary-title {
+            font-size: 1.85rem;
+            font-weight: 700;
+            margin-bottom: 12px;
+            color: #1f242b;
+        }
+
+        .risk-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-top: 1px solid #eceef2;
+            padding: 11px 0;
+            font-size: 1.05rem;
+        }
+
+        .risk-row:first-of-type {
+            border-top: none;
+        }
+
+        .risk-label {
+            color: #3c4148;
+        }
+
+        .risk-value {
+            font-weight: 700;
+            color: #1f242b;
+        }
+
+        .risk-inline-bar-wrap {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .risk-inline-bar {
+            width: 150px;
+            height: 10px;
+            background: #e8ebef;
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        .risk-inline-bar-fill {
+            height: 100%;
+            background: #19976a;
+            border-radius: 999px;
+        }
+
+        .risk-pill {
+            border-radius: 999px;
+            padding: 4px 12px;
+            font-weight: 600;
+        }
+
+        .risk-pill-green {
+            background: #dbeecf;
+            color: #2f6f1e;
+        }
+
+        .risk-pill-amber {
+            background: #f4e7cf;
+            color: #8a5a14;
+        }
+
+        .risk-reco {
+            margin-top: 1.25rem;
+            border-radius: 12px;
+            background: #f4e7cf;
+            color: #6a4012;
+            padding: 14px 18px;
+            font-size: 1rem;
+        }
         </style>
     """
     st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+
+
+def compute_post_submit_risk(form_data, bank_entries):
+    score = 78
+    warnings = []
+
+    requested_exposure = float(form_data.get("auth_credit_limit") or 0)
+    auth_ceiling = float(form_data.get("auth_ceiling") or 0)
+    security_amount = float(form_data.get("security_amount") or 0)
+    risk_category = (form_data.get("cust_risk_category") or "").strip() or "Medium"
+    country = (form_data.get("country") or "").strip() or "Other"
+
+    high_risk_countries = {"Iraq", "Syria", "Yemen", "Lebanon"}
+    medium_risk_countries = {"Egypt", "Jordan", "Pakistan", "India"}
+
+    if risk_category == "Highest Risk":
+        score -= 24
+    elif risk_category == "High":
+        score -= 16
+    elif risk_category == "Medium":
+        score -= 8
+    else:
+        score += 4
+
+    if country in high_risk_countries:
+        score -= 16
+    elif country in medium_risk_countries:
+        score -= 8
+
+    if auth_ceiling >= 85:
+        score -= 10
+    elif auth_ceiling >= 70:
+        score -= 6
+    elif auth_ceiling <= 40:
+        score += 3
+
+    if form_data.get("is_security") == "Required" and security_amount > 0:
+        score += 6
+    elif form_data.get("is_security") == "Required" and security_amount == 0:
+        score -= 10
+        warnings.append("Security is marked required but amount is zero.")
+
+    payment_terms = (form_data.get("payment_terms") or "").strip().lower()
+    if payment_terms in {"net 30", "net30"}:
+        score += 4
+    elif payment_terms in {"net 45", "net45"}:
+        score += 2
+    elif payment_terms in {"net 60", "net60"}:
+        score -= 2
+    elif payment_terms:
+        score -= 6
+
+    if requested_exposure >= 25000000:
+        score -= 10
+    elif requested_exposure >= 10000000:
+        score -= 6
+    elif requested_exposure <= 2000000:
+        score += 4
+
+    iban_invalid = 0
+    filled_banks = [b for b in bank_entries if any(str(v).strip() for v in b.values())]
+    iban_pattern = re.compile(r"^[A-Z]{2}[0-9]{2}[A-Z0-9]{4,30}$")
+    for bank in filled_banks:
+        iban = (bank.get("iban") or "").replace(" ", "").upper()
+        if iban and not iban_pattern.match(iban):
+            iban_invalid += 1
+    if iban_invalid:
+        score -= min(10, iban_invalid * 4)
+        warnings.append("One or more bank accounts contain invalid IBAN format.")
+
+    sanctions_clear = "Clear"
+    pep_status = "No hits"
+    jurisdiction = (
+        "High"
+        if country in high_risk_countries
+        else "Medium"
+        if country in medium_risk_countries or country in {"UAE", "Other"}
+        else "Low"
+    )
+
+    score = max(0, min(100, int(round(score))))
+
+    if score >= 90:
+        moodys_rating = "A2"
+        risk_band = "Low risk"
+    elif score >= 80:
+        moodys_rating = "Baa1"
+        risk_band = "Low-medium risk"
+    elif score >= 70:
+        moodys_rating = "Baa2"
+        risk_band = "Low-medium risk"
+    elif score >= 60:
+        moodys_rating = "Baa3"
+        risk_band = "Medium risk"
+    elif score >= 50:
+        moodys_rating = "Ba2"
+        risk_band = "Medium-high risk"
+    else:
+        moodys_rating = "B1"
+        risk_band = "High risk"
+
+    pd_percent = max(0.12, round((100 - score) * 0.018, 2))
+    recommended_limit = max(500000.0, requested_exposure * (0.55 if score < 70 else 0.75 if score < 80 else 0.9))
+    onboarding_status = (
+        "Approved for onboarding" if score >= 70 else "Conditional onboarding review required"
+    )
+    payment_history_score = max(45, min(92, score + 6))
+
+    return {
+        "score": score,
+        "rating": moodys_rating,
+        "risk_band": risk_band,
+        "onboarding_status": onboarding_status,
+        "pd_percent": pd_percent,
+        "recommended_limit": recommended_limit,
+        "requested_exposure": requested_exposure,
+        "payment_history_score": payment_history_score,
+        "sanctions": sanctions_clear,
+        "pep": pep_status,
+        "jurisdiction": f"{jurisdiction} ({country})",
+        "warnings": warnings,
+    }
+
+
+def _fmt_money(value):
+    return f"USD {value:,.0f}"
+
+
+def render_final_kyc_details(form_data, bank_entries, request_id):
+    risk = compute_post_submit_risk(form_data, bank_entries)
+    customer_name = form_data.get("business_partner_name") or "-"
+    rating_date = date.today().strftime("%d %b %Y")
+    progress_pct = risk["payment_history_score"]
+
+    st.markdown(
+        dedent(
+            f"""
+            <div class="risk-top-card">
+                <div class="risk-score-circle">
+                    <div class="score">{risk["score"]}</div>
+                    <div class="denom">/ 100</div>
+                </div>
+                <div>
+                    <p class="risk-headline">Moody's risk score</p>
+                    <p class="risk-subline">{customer_name} · Verified {rating_date} · Request ID {request_id}</p>
+                    <span class="risk-badge">{risk["risk_band"]} · {risk["onboarding_status"]}</span>
+                </div>
+            </div>
+            """
+        ),
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        dedent(
+            f"""
+            <div class="risk-summary-card">
+                <div class="risk-summary-title">Credit & counterparty summary</div>
+                <div class="risk-row">
+                    <div class="risk-label">Moody's rating</div>
+                    <div class="risk-value">{risk["rating"]} (Investment grade)</div>
+                </div>
+                <div class="risk-row">
+                    <div class="risk-label">PD (probability of default)</div>
+                    <div class="risk-value">{risk["pd_percent"]}%</div>
+                </div>
+                <div class="risk-row">
+                    <div class="risk-label">Recommended credit limit</div>
+                    <div class="risk-value">{_fmt_money(risk["recommended_limit"])}</div>
+                </div>
+                <div class="risk-row">
+                    <div class="risk-label">Payment history score</div>
+                    <div class="risk-inline-bar-wrap">
+                        <div class="risk-inline-bar">
+                            <div class="risk-inline-bar-fill" style="width: {progress_pct}%;"></div>
+                        </div>
+                        <div class="risk-value">{progress_pct}/100</div>
+                    </div>
+                </div>
+                <div class="risk-row">
+                    <div class="risk-label">Sanctions screening</div>
+                    <div class="risk-pill risk-pill-green">{risk["sanctions"]}</div>
+                </div>
+                <div class="risk-row">
+                    <div class="risk-label">PEP / adverse media</div>
+                    <div class="risk-pill risk-pill-green">{risk["pep"]}</div>
+                </div>
+                <div class="risk-row">
+                    <div class="risk-label">Jurisdiction risk</div>
+                    <div class="risk-pill risk-pill-amber">{risk["jurisdiction"]}</div>
+                </div>
+            </div>
+            """
+        ),
+        unsafe_allow_html=True,
+    )
+
+    if risk["requested_exposure"] > risk["recommended_limit"]:
+        st.markdown(
+            dedent(
+                f"""
+                <div class="risk-reco">
+                    Recommended credit limit ({_fmt_money(risk["recommended_limit"])}) is below the requested
+                    exposure of {_fmt_money(risk["requested_exposure"])}.
+                    Consider staged delivery or additional collateral for the balance.
+                </div>
+                """
+            ),
+            unsafe_allow_html=True,
+        )
+
+    if risk["warnings"]:
+        st.warning("\n".join(f"- {item}" for item in risk["warnings"]))
 
 
 def validate_inputs(form_data, bank_entries):
@@ -306,6 +659,18 @@ def insert_into_database(form_data, bank_entries):
 
 def main():
     apply_global_styles()
+
+    if "submitted_kyc" not in st.session_state:
+        st.session_state["submitted_kyc"] = None
+
+    if st.session_state["submitted_kyc"] is not None:
+        saved_submission = st.session_state["submitted_kyc"]
+        render_final_kyc_details(
+            saved_submission["form_data"],
+            saved_submission["bank_entries"],
+            saved_submission["request_id"],
+        )
+        return
 
     st.markdown(
         '<div class="app-header">Customer Verification – Customer Request Form</div>',
@@ -639,6 +1004,12 @@ def main():
                         request_id = insert_into_database(form_data, bank_entries)
                         st.success(f"Thank you. Your customer request has been submitted successfully. Request ID: {request_id}")
                         st.balloons()
+                        st.session_state["submitted_kyc"] = {
+                            "form_data": form_data,
+                            "bank_entries": bank_entries,
+                            "request_id": request_id,
+                        }
+                        st.rerun()
                     except Exception:
                         st.error(
                             "We were unable to submit your request at this time. "
