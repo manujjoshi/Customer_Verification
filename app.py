@@ -285,6 +285,88 @@ def compute_post_submit_risk(form_data, bank_entries):
     elif requested_exposure <= 2000000:
         score += 4
 
+    # KYC completeness and document quality adjustments
+    core_fields = [
+        "business_partner_name",
+        "street",
+        "city",
+        "country",
+        "payment_terms",
+        "vat_id",
+        "trade_licence_no",
+        "finance_mail_id",
+    ]
+    missing_core_fields = sum(1 for key in core_fields if not str(form_data.get(key) or "").strip())
+    if missing_core_fields:
+        score -= min(15, missing_core_fields * 2)
+        warnings.append(f"{missing_core_fields} key KYC field(s) are incomplete.")
+
+    vat_id = str(form_data.get("vat_id") or "").strip()
+    if vat_id:
+        if len(vat_id) < 5:
+            score -= 8
+            warnings.append("VAT ID quality is weak (length below expected threshold).")
+        elif len(vat_id) >= 10:
+            score += 2
+
+    unique_id = str(form_data.get("unique_identification_number") or "").strip()
+    if unique_id:
+        score += 2
+    else:
+        score -= 3
+
+    # Trade licence validity sensitivity
+    tl_from = form_data.get("trade_licence_valid_from")
+    tl_till = form_data.get("trade_licence_valid_till")
+    if tl_till and isinstance(tl_till, date):
+        days_left = (tl_till - date.today()).days
+        if days_left < 0:
+            score -= 16
+            warnings.append("Trade licence appears expired.")
+        elif days_left < 30:
+            score -= 10
+            warnings.append("Trade licence is close to expiry (under 30 days).")
+        elif days_left < 90:
+            score -= 5
+        else:
+            score += 2
+    if tl_from and tl_till and isinstance(tl_from, date) and isinstance(tl_till, date):
+        if tl_till <= tl_from:
+            score -= 8
+            warnings.append("Trade licence validity dates are inconsistent.")
+
+    # Security cover ratio sensitivity
+    if requested_exposure > 0 and security_amount > 0:
+        coverage_ratio = security_amount / requested_exposure
+        if coverage_ratio >= 0.8:
+            score += 6
+        elif coverage_ratio >= 0.5:
+            score += 3
+        elif coverage_ratio < 0.2:
+            score -= 4
+
+    # Contact quality checks
+    email_pattern = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+    finance_email = str(form_data.get("finance_mail_id") or "").strip()
+    business_email = str(form_data.get("other_business_mail_id") or "").strip()
+    if finance_email and not email_pattern.match(finance_email):
+        score -= 4
+        warnings.append("Finance email format appears invalid.")
+    if business_email and not email_pattern.match(business_email):
+        score -= 4
+        warnings.append("Business email format appears invalid.")
+    if finance_email and business_email and finance_email.lower() == business_email.lower():
+        score -= 2
+
+    mobile_no = normalize_phone(str(form_data.get("mobile_no") or ""))
+    phone_pattern = re.compile(r"^\+?[0-9]{7,15}$")
+    if mobile_no:
+        if phone_pattern.match(mobile_no):
+            score += 1
+        else:
+            score -= 3
+            warnings.append("Primary mobile number format appears invalid.")
+
     iban_invalid = 0
     filled_banks = [b for b in bank_entries if any(str(v).strip() for v in b.values())]
     iban_pattern = re.compile(r"^[A-Z]{2}[0-9]{2}[A-Z0-9]{4,30}$")
@@ -295,6 +377,22 @@ def compute_post_submit_risk(form_data, bank_entries):
     if iban_invalid:
         score -= min(10, iban_invalid * 4)
         warnings.append("One or more bank accounts contain invalid IBAN format.")
+
+    # Bank record completeness sensitivity
+    if not filled_banks:
+        score -= 8
+        warnings.append("No bank details supplied for settlement validation.")
+    else:
+        incomplete_bank_rows = 0
+        for bank in filled_banks:
+            required_bank_fields = ["iban", "bank_name", "bank_country_region", "swift_bic"]
+            if any(not str(bank.get(field) or "").strip() for field in required_bank_fields):
+                incomplete_bank_rows += 1
+        if incomplete_bank_rows:
+            score -= min(8, incomplete_bank_rows * 3)
+            warnings.append(f"{incomplete_bank_rows} bank profile(s) are missing key fields.")
+        else:
+            score += 2
 
     sanctions_clear = "Clear"
     pep_status = "No hits"
@@ -386,7 +484,9 @@ def render_final_kyc_details(form_data, bank_entries, request_id):
                 <div class="risk-summary-title">Credit & counterparty summary</div>
                 <div class="risk-row">
                     <div class="risk-label">Moody's rating</div>
-                    <div class="risk-value">{risk["rating"]} (Investment grade)</div>
+                    <div class="risk-value">
+                        {risk["rating"]} ({'Investment grade' if risk["rating"].startswith('A') or risk["rating"].startswith('Baa') else 'Speculative grade'})
+                    </div>
                 </div>
                 <div class="risk-row">
                     <div class="risk-label">PD (probability of default)</div>
